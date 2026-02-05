@@ -1,0 +1,245 @@
+There are three mostly separate issues here: texture sampling (mip bias / AF), using detail maps at extreme distance, and geometric LOD transitions. Addressing each in the right way matters more than any single “magic” setting.
+
+***
+
+## 1. Mip‑map LOD bias for shallow angles and distant terrain
+
+### What mip bias actually does
+
+Hardware computes a base mip level \(\lambda\) from the screen‑space derivatives of your texture coordinates (essentially \(\lambda = \log_2(\rho)\) where \(\rho\) is how many texels a pixel covers). A mip‑map LOD bias just adds an offset: [community.khronos](https://community.khronos.org/t/mipmapping-gl-texture-lod-bias/107717)
+
+\[
+\lambda' = \lambda + \text{bias}
+\]
+
+- Negative bias → forces use of *higher‑res* mips than the hardware would normally choose (sharper, but more aliasing).
+- Positive bias → forces *lower‑res* mips (softer, but less aliasing).
+- GPU defaults are 0; NVidia’s docs explicitly state the reset value is 0. [developer.download.nvidia](https://developer.download.nvidia.com/cg/MipMapLodBiasi.html)
+
+Empirically, using negative bias for “more sharpness” is exactly what causes the kind of shimmering you’re seeing, especially on ground at grazing angles. [reddit](https://www.reddit.com/r/pcmasterrace/comments/433c5x/can_someone_explain_lod_bias_texture_filtering/)
+
+### Recommended high‑level strategy
+
+**1. Keep the global mip bias at 0.**
+
+- Let the hardware AF do its job. A common recommendation from people debugging shimmering is “set LOD bias to zero and turn anisotropic filtering as high as it’ll go.” [reddit](https://www.reddit.com/r/pcmasterrace/comments/433c5x/can_someone_explain_lod_bias_texture_filtering/)
+- If you can, clamp negative LOD bias for certain resources (many drivers/engines have an option like “Negative LOD bias: clamp” to stop apps from pulling too‑sharp mips and shimmering fences/terrain). [avsim](https://www.avsim.com/forums/topic/61873-hooray-solution-to-mipbias-reducing-blurries-but-causing-shimmers/)
+
+**2. Do *per‑texture* biasing, not global, and be conservative.**
+
+- For **albedo/color terrain textures**, if they look too blurry at mid distance, use at most a *small* negative bias (like −0.3 to −0.5) and only if your TAA is good.
+- For **normal/specular detail maps**, do the opposite: give them a *positive* bias (e.g. +0.5 to +1.0) so they switch to blurrier mips earlier. This is a big win against specular shimmer, because the normal map is usually the main culprit.
+
+**3. Prefer distance‑based and *material‑aware* bias over pure angle‑based bias.**
+
+- The hardware already handles angle implicitly via anisotropic filtering: it samples more along the stretched axis, and picks mips based on the worst‑case derivative. [community.khronos](https://community.khronos.org/t/mipmapping-gl-texture-lod-bias/107717)
+- Adding *angle‑based negative bias* (e.g. “sharpen more at grazing angles”) fights the hardware’s attempt to avoid aliasing and almost always increases shimmer.
+- If you want to use view angle, use it to *blur* at grazing angles, not sharpen. Example pattern:
+
+```glsl
+// N, V in world or view space, normalized
+float grazing = 1.0 - abs(dot(N, V)); // 0 = facing, 1 = edge-on
+float extraBlur = grazing * kGrazingBias; // kGrazingBias > 0, e.g. 0.5
+
+vec4 color = textureLod(albedoTex, uv, baseLod + extraBlur);
+```
+
+So:
+
+- **Distance bias:** mostly positive (more blur) for far terrain to kill crawling detail.
+- **Angle bias:** if used at all, also positive at grazing angles.
+- **Never** use negative bias at the horizon; that’s exactly where aliasing is worst.
+
+In practice, *the best bang for your buck against shimmering* tends to be:
+
+- Good TAA (or at least some temporal filter).
+- Slight positive bias on normal/detail maps.
+- Slight distance‑based boost in roughness for specular (see below).
+
+***
+
+## 2. Detail mapping at 20 km: useful or just more noise?
+
+Detail maps are great in the near/mid field, but they are inherently dangerous at very long distances:
+
+- A tiled high‑frequency noise/detail texture at 20 km is way beyond the Nyquist limit; each pixel covers a huge area, so tiny details turn into harsh flicker unless *aggressively* filtered.
+- Even with proper mipmaps, if the base texture is very high contrast and tightly tiled, the coarse mips will still have visible “sparkle” patterns when minified.
+
+**Use detail mapping only up to mid distance, then fade it out.**
+
+A common pattern:
+
+```glsl
+float dist = length(worldPos - cameraPos);
+
+// Distances where detail is visible
+const float detailStart = 50.0;   // start fading in
+const float detailEnd   = 500.0;  // fully faded out by here
+
+float detailFade = smoothstep(detailEnd, detailStart, dist); // 1 near, 0 far
+
+vec3 baseColor   = texture(albedoBase, baseUV).rgb;
+vec3 detailColor = texture(albedoDetail, detailUV * detailTiling).rgb;
+
+// Keep the detail low amplitude so it doesn’t explode at mid distances
+vec3 finalColor = baseColor * (1.0 + (detailColor - 0.5) * 0.3 * detailFade);
+```
+
+Key points for 20 km scale terrain:
+
+- **Don’t rely on detail maps to “fake” high‑res at that distance.** They’ll mostly introduce more high‑frequency noise and shimmer, not actual information.
+- Use a **low‑frequency “macro” texture** (e.g., satellite texture or procedural large‑scale color modulation) to add visual interest at long range. Its frequency should be comparable to or larger than pixels at the horizon, so it doesn’t alias.
+- On the *very far* mip levels of the detail texture, make sure the texture is almost flat (low contrast). That way, even if it’s still sampled, it won’t produce strong flicker.
+
+If you see specular shimmer on far terrain, also:
+
+- Fade **normal map strength** and **specular intensity** with distance.
+- Or increase roughness with distance so highlights are broader and less “sparkly.”
+
+These steps are usually more effective than trying to hide problems purely with a noise overlay.
+
+***
+
+## 3. Geomorphing logic and a vertex shader approach
+
+The core idea of geomorphing: instead of immediately switching from LOD N to LOD N+1 (causing popping), you smoothly move vertices from their N‑mesh positions to their N+1 positions over some distance/parameter range. [github](https://github.com/tschie/terrain-cdlod)
+
+### Conceptual steps
+
+1. **Continuous LOD factor**  
+   Compute a continuous LOD value based on distance:
+
+   \[
+   \text{lodCont} = \text{clamp}\left(\frac{d - d_\text{near}}{d_\text{far} - d_\text{near}}, 0, 1\right)
+   \]
+
+   Where \(d\) is camera distance to patch center, and \([d_\text{near}, d_\text{far}]\) is the transition band for that LOD level.
+
+2. **Patch LOD and morph factor**
+
+   - Let `lodIndex = floor(lodCont)` be the discrete LOD level for the patch.
+   - Let `morph = fract(lodCont)` be in  indicating how far between LOD `lodIndex` and `lodIndex+1` you are. [dl.acm](https://dl.acm.org/doi/10.1145/383507.383533)
+
+3. **Two positions per vertex (or one plus a delta)**
+
+   For each vertex of a patch, you need:
+
+   - Position at the **current** LOD (higher detail).
+   - Position at the **parent** LOD (lower detail) *for the same logical location*.
+
+   Many terrain LOD schemes preprocess this and store a **morph delta** per vertex:
+   \[
+   \Delta p = p_\text{coarse} - p_\text{fine}
+   \]
+
+4. **Vertex shader interpolation**
+
+   In the vertex shader, interpolate:
+
+   \[
+   p_\text{world} = p_\text{fine} + \text{morph} \cdot \Delta p
+   \]
+
+   When `morph = 0`, you see pure fine LOD; when `morph = 1`, vertices sit exactly where the coarse LOD vertices would be, so switching indices no longer causes popping. [ims.tuwien.ac](https://www.ims.tuwien.ac.at/publications/tuw-138077.pdf)
+
+### Simple example: heightmap / geomipmapping style
+
+Assume:
+
+- Each patch is a grid of vertices sampled from a heightmap.
+- On the CPU (offline or at load time), you compute for each vertex how much it should move when the patch goes to the next coarser LOD, and store it as `morphOffset` (usually just a height delta).
+
+Vertex layout (per vertex):
+
+- `float3 posFine;` // high LOD world‑space or local position
+- `float morphHeight;` // offset to get to coarse height when morphFactor == 1
+- `float morphMask;` // 0 or 1: whether this vertex participates in morph (useful for edge rules)
+
+Uniforms per patch:
+
+- `float morphFactor;` // 0..1, based on camera distance in the patch’s LOD band
+- `float4x4 worldViewProj;`
+
+Vertex shader sketch:
+
+```glsl
+struct VSInput {
+    float3 posFine      : POSITION;
+    float  morphHeight  : TEXCOORD0; // or COLOR, etc.
+    float  morphMask    : TEXCOORD1; // 0 = no morph, 1 = full morph capability
+};
+
+cbuffer PatchParams {
+    float   uMorphFactor;   // 0..1
+    float4x4 uWorldViewProj;
+};
+
+VSOutput VSMain(VSInput IN)
+{
+    VSOutput OUT;
+
+    float3 pos = IN.posFine;
+
+    // Only some vertices (e.g. at specific grid locations) morph towards coarse LOD
+    float effectiveMorph = uMorphFactor * IN.morphMask;
+
+    pos.y += IN.morphHeight * effectiveMorph;
+
+    OUT.position = mul(uWorldViewProj, float4(pos, 1.0));
+
+    // ... pass through other attributes (uv, normals) as needed
+
+    return OUT;
+}
+```
+
+CPU‑side logic per frame:
+
+```cpp
+float dist = length(patchCenter - cameraPos);
+
+// Example band: start morphing at 800, finish at 1000 units
+float morph = saturate((dist - 800.0f) / (1000.0f - 800.0f));
+patch.morphFactor = morph;
+
+// Choose LOD index based on dist (using same or slightly offset ranges)
+// Important: when morph == 1.0, the patch’s vertices are already at the coarse positions,
+// so switching index buffers to coarse doesn’t cause a pop.
+```
+
+### Handling seams between patches
+
+The tricky part is making sure **neighboring patches** (possibly at different LODs) don’t crack:
+
+- Many terrain LOD methods (e.g., CDLOD, geomipmapping with skirts, or the “Terrain Geomorphing in the Vertex Shader” paper) use:
+  - Either **skirts**: extra geometry under the edges to hide cracks, or
+  - **Per‑edge morphing** rules: edges of the finer patch are forced to align with vertices of the coarser neighbor and morph in a compatible way. [github](https://github.com/tschie/terrain-cdlod)
+- In practice, this means:
+  - You tag vertices on each edge differently (e.g., left, right, top, bottom).
+  - For a given neighbor LOD difference, you adjust `morphMask` or the delta for those specific vertices so that at full morph, the edge collapses to the coarser pattern.
+
+For an initial implementation, it is simpler to:
+
+- Use **chunked LOD with skirts** first (no cracks, fewer rules).
+- Then introduce per‑vertex morph deltas as above to eliminate popping.
+- Only then, if necessary, refine to more advanced schemes like CDLOD‑style continuous morphing.
+
+***
+
+### Putting it together for your case
+
+To reduce the shimmering you see on distant, grazing‑angle terrain:
+
+1. **Reset mip LOD bias to 0 globally**; avoid heavy negative bias.
+2. **Keep AF at max**, but:
+   - Apply *positive* mip bias to normal/detail maps.
+   - Optionally add distance‑ and angle‑based *blur* (positive LOD bias), not sharpen.
+3. **Do not use detail maps to simulate resolution at 20 km.**
+   - Use them only up to mid distance, then fade out.
+   - Use low‑frequency macro textures and distance‑based specular/normal attenuation for the far horizon.
+4. **Implement geomorphing in the vertex shader** with:
+   - Precomputed per‑vertex morph offsets (or dual positions).
+   - A per‑patch `morphFactor` based on camera distance.
+   - Optional edge masks to keep neighbors in sync.
+
+If you share a bit more about your current terrain system (heightmap vs meshes, chunk size, engine/API), a more concrete shader snippet (GLSL/HLSL, and how to compute the morph deltas) can be tailored to match exactly what you’re doing.

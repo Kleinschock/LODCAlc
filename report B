@@ -1,0 +1,219 @@
+Answers in brief:
+
+- For a 20 km view distance, splitting every 1024 m tile into 4×512 m purely for CPU frustum culling is usually not worth the extra draw calls. Keep large patches in the far field; only subdivide near the camera or if you can batch many patches into a small number of draws.
+- For a modern PC flight sim terrain, you generally do not want 1:1 triangles:pixel. Most successful shipped systems target triangles several pixels across on average, roughly 0.05–0.25 triangles per pixel over the screen.
+- Nanite and geometry clipmaps both aim for roughly constant screen‑space triangle size, but they solve different problems. For a pure heightfield-based flight sim with fast, high-altitude camera motion, a clipmap/CDLOD-style terrain plus conventional rendering is usually simpler and at least as efficient for the base terrain; Nanite shines for complex static meshes (airports, photogrammetry, cliffs/overhangs) layered on top.
+
+Below are the details.
+
+***
+
+## 1. 1024 m tiles vs 4×512 m quadtree nodes
+
+You are trading:
+
+- **CPU cost per draw** (driver, command submission, state changes)
+- vs **GPU work per triangle** (vertex shading, raster, depth)
+
+On modern DX12/Vulkan-class PCs, geometry throughput is high and draw calls are still not “free.” Practical implications:
+
+### How much does quadtree frustum culling help at 20 km?
+
+At 20 km view distance in a flight sim:
+
+- The **visible footprint on the ground is huge** (tens of km wide), and there is almost no occlusion.
+- For large, fairly flat 1024 m tiles, a tile is typically either:
+  - completely inside the frustum, or
+  - completely outside it,
+  - with relatively few tiles intersecting the frustum boundary.
+
+If you split each 1024 m tile into 4×512 m nodes **only to frustum‑cull them**, in the far field you often end up drawing 3 or 4 children for every parent that would already be considered “mostly visible.” The extra CPU work + draw calls buy you only a thin strip of culled triangles along the frustum edge.
+
+In other words, you are paying ~4× draw calls for perhaps 10–20% triangle savings in the best case, and often much less.
+
+For a high‑altitude flight sim, that is almost always a poor trade unless:
+
+- Your tiles are extremely dense (millions of tris per 1024×1024 m patch), and
+- You are clearly **GPU‑bound on vertex/raster** rather than on CPU/driver.
+
+### When quadtree subdivision *does* make sense
+
+Quadtree/clipmap‑style subdivision is very useful, but mainly when you combine it with:
+
+- **LOD selection**: finer patches near the camera, coarser farther away.
+- **Visibility/occlusion** in more cluttered scenes (cities, mountains, interiors).
+- **GPU tessellation** where you’re capping triangle size in screen space.
+
+Examples:
+
+- Frostbite’s CDLOD-style terrain and adaptive tessellation use quadtrees to drive LOD and to keep screen‑space triangle size roughly constant, not just for frustum culling. [media.contentapi.ea](https://media.contentapi.ea.com/content/dam/eacom/frostbite/files/adaptive-terrain-tessellation.pdf)
+- Geometry clipmaps (Losasso & Hoppe, GPU Gems 2) use nested grids centered around the viewer; the *grid rings* are the patches, and they are few and large, keeping draw calls low. [developer.nvidia](https://developer.nvidia.com/gpugems/gpugems2/part-i-geometric-complexity/chapter-2-terrain-rendering-using-gpu-based-geometry)
+
+### Practical recommendation for your setup
+
+Given 1024 m base tiles and 20 km view distance:
+
+- **Keep 1024 m as the primary culling unit in the mid/far field.**
+  - Simple AABB-vs-frustum test on the CPU is cheap.
+  - Let the GPU clip triangles at the frustum boundary; that’s what it’s good at.
+- **Only introduce smaller nodes (e.g., 512 m, 256 m)**:
+  - Close to the camera, where:
+    - You run higher LOD, and
+    - Patches are more frequently partially inside the frustum.
+  - Or if you can **batch many child patches into a single draw** via instancing or indirect multi‑draw (so you don’t pay 1 draw call per chunk).
+
+Rule of thumb: aim to keep **at least a few thousand triangles per draw** for terrain. If splitting from 1024→4×512 pushes many patches below that and you are not clearly GPU‑bound on geometry, avoid the split.
+
+***
+
+## 2. “Industry standard” triangle density for flight sim terrain
+
+There is no single standard, but there *are* strong patterns from prominent engines and papers, all expressed as **target triangle size in screen pixels**, not triangles per pixel.
+
+### Reference points from shipped tech
+
+1. **NVIDIA “DirectX 11 Terrain Tessellation” whitepaper** (H.A.W.X. 2–style terrain):
+   - Uses a screen‑space LOD algorithm that **targets a constant triangle width in pixels**.
+   - Default target triangle width is **3 pixels**; at 1920×1200 this yields about **2.5 million triangles** for the terrain in the default view at ~92 FPS on 2011 hardware. [picture.iczhiku](https://picture.iczhiku.com/resource/paper/syIWkyWiwiEkWNCc.pdf)
+   - They explicitly warn that “too many triangles that are very small can negatively impact rasterizer efficiency,” and advocate tuning target triangle size as the main performance knob. [picture.iczhiku](https://picture.iczhiku.com/resource/paper/syIWkyWiwiEkWNCc.pdf)
+
+2. **Frostbite 2 adaptive terrain tessellation**:
+   - Implements an adaptive scheme with a “density map” controlling tessellation.
+   - Systematically evaluates visual error vs performance for different triangle widths.
+   - Recommends a **triangle width of ~6 pixels** with 8 patch faces per side as a good quality/performance sweet spot. [media.contentapi.ea](https://media.contentapi.ea.com/content/dam/eacom/frostbite/files/adaptive-terrain-tessellation.pdf)
+
+Both are large‑scale terrain systems (Frostbite: Battlefield; Cantlay: H.A.W.X. 2 flight sim), and both converge on **triangles that are several pixels across**, not 1 tri per pixel.
+
+### Converting to triangles per pixel (roughly)
+
+For equilateral-ish triangles:
+
+- Triangle of **edge length w pixels** covers ~0.4–0.5 × w² pixels.
+- So triangles per pixel ≈ 1 / (0.4–0.5 × w²).
+
+Plugging in:
+
+- **w = 3 px** (NVIDIA default) → about **0.2–0.25 triangles/pixel.**
+- **w = 6 px** (Frostbite sweet spot) → about **0.05–0.07 triangles/pixel.**
+
+Given that modern GPUs are *much* faster than 2011 hardware but screens are also larger (1440p, 4K, ultrawide), these numbers are still a solid ballpark for **terrain**:
+
+> For a modern PC flight sim terrain, targeting **0.05–0.25 triangles per pixel** on average (triangles several pixels wide) is typical and efficient.
+
+### So: is 1:1 or 0.5:1 a good target?
+
+For a conventional heightfield/LOD terrain:
+
+- **1:1 (one triangle per pixel)**:
+  - Implies triangles ~1 px wide – essentially micro‑polygons.
+  - This is *far beyond* what most terrain systems aim for; it pushes you toward being **raster/ROP bound** long before you run out of triangle throughput.
+  - Appropriate only in very special cases (offline renderers, Nanite-style virtualized geometry rendering, or extremely close-up displacement surfaces).
+
+- **0.5:1 (one triangle per 2 pixels)**:
+  - Still significantly denser than the Frostbite and NVIDIA recommendations.
+  - Might be acceptable in the near field (around the aircraft) if the GPU has headroom, but is excessive for the entire far field.
+
+For a flight sim with huge views, it is almost always better to:
+
+- Aim for **triangles ~4–8 pixels across on average** (say 0.06–0.2 tris/pixel).
+- Concentrate triangles near the aircraft and in high‑curvature regions (mountain ridges, airport geometry) and keep the far flat areas coarser.
+- Use a **screen‑space LOD metric** (distance & projected size) rather than a fixed “tris per world meter” target.
+
+***
+
+## 3. Nanite vs Geometry Clipmaps for fast, high-altitude terrain
+
+### What each system optimizes for
+
+**Geometry Clipmaps (Losasso & Hoppe; GPU Gems 2)**
+
+- Represent terrain as **nested regular grids (“rings”) centered on the camera**.
+- Height data stored as mipmapped images; vertex data kept in GPU memory and updated incrementally as the camera moves. [hhoppe](https://hhoppe.com/gpugcm.pdf)
+- Key properties:
+  - **Constant vertex count per frame** (independent of view distance).
+  - **Few large draw calls**, often one per ring.
+  - Designed explicitly for **interactive flight over huge datasets** (they demonstrate flight over a 20‑billion‑sample US heightmap at ~60–90 FPS). [developer.nvidia](https://developer.nvidia.com/gpugems/gpugems2/part-i-geometric-complexity/chapter-2-terrain-rendering-using-gpu-based-geometry)
+  - Extremely stable under fast camera movement; updates are toroidal and incremental.
+
+**Unreal Engine 5 Nanite**
+
+- Virtualized geometry system; meshes are stored as **clusters (meshlets)**, with fine‑grained streaming and view‑dependent simplification.
+- Nanite strives for **“pixel scale detail”** and “renders only the detail that can be perceived”. [dev.epicgames](https://dev.epicgames.com/documentation/en-us/unreal-engine/nanite-virtualized-geometry-in-unreal-engine)
+- In practice:
+  - It attempts to keep triangle counts roughly **proportional to pixels covered**, i.e., a near‑constant triangles‑per‑pixel ratio.
+  - Automatically handles LOD; no manual per‑mesh LODs.
+  - Aggressive occlusion culling and cluster culling; frame budgets become more about materials/shaders and overdraw than about polycount or draw calls. [dev.epicgames](https://dev.epicgames.com/documentation/en-us/unreal-engine/nanite-virtualized-geometry-in-unreal-engine)
+- Intended primarily for **static or mostly static geometry**, but Epic states that fast movement of Nanite static meshes is supported and that the **speed of distance change does not significantly affect Nanite performance**, as streaming is throttled and batched. [forums.unrealengine](https://forums.unrealengine.com/t/nanite-with-fast-moving-geometry/2672588)
+
+### For fast, high-altitude flight specifically
+
+**Clipmaps / CDLOD-style terrain:**
+
+Pros:
+
+- **Perfectly suited to huge, mostly heightfield terrains** (Earth‑scale or regional); almost all academic and many commercial flight systems use some variant of:
+  - Quadtree/clipmap grid + view‑dependent LOD + GPU tessellation. [media.contentapi.ea](https://media.contentapi.ea.com/content/dam/eacom/frostbite/files/adaptive-terrain-tessellation.pdf)
+- Very **predictable performance** under:
+  - Extreme view distances (hundreds of km).
+  - Very fast camera motion (jet aircraft, orbital views).
+- You control:
+  - Screen‑space triangle size (via tessellation/LOD).
+  - Draw call count (few grid rings).
+  - Memory use (mipmapped height/texture clipmaps).
+- Implementation is mostly math and a bit of GPU plumbing; no complex build pipeline.
+
+Cons:
+
+- **Only heightfields** (no overhangs, caves, vertical cliffs without tricks).
+- Authoring non‑DEM detail (overhang rock faces, buildings) must be done as separate meshes.
+
+**Nanite:**
+
+Pros:
+
+- Handles **arbitrary geometry**, including overhangs, caves, and extremely detailed photogrammetry.
+- LOD and culling are automatic; you can stream vast amounts of geometry and let Nanite manage detail. [dev.epicgames](https://dev.epicgames.com/documentation/en-us/unreal-engine/nanite-virtualized-geometry-in-unreal-engine)
+- Conceptually aligns with a “1 triangle per pixel” ideal: very high detail close up, automatic simplification farther away. [forums.unrealengine](https://forums.unrealengine.com/t/decrease-tesselation-triangle-density-based-on-distance-screensize-with-nanite/2003507)
+
+Cons / caveats for a flight sim base terrain:
+
+- **World scale & precision**: while UE5 has large world coordinates and world partition, building an Earth‑scale, high‑altitude flight sim on top of it is non‑trivial (floating‑point precision, streaming logistics, nav systems).
+- **Terrain representation**:
+  - Nanite Landscapes exist, but:
+    - There are still constraints (material complexity, tessellation/displacement behavior, foliage workflows, etc.).
+    - Nanite doesn’t magically solve texture/DEM streaming, atmospheric scattering, etc.; you still solve all the usual sim‑specific problems.
+- **Triangle density behavior**:
+  - Nanite’s cluster simplification keeps triangle counts proportional to pixels, but the internal heuristics are optimized for general static assets, not specifically for razor‑thin heightfield terrain at extreme distances.
+  - For pure distant terrain, a clipmap-heightfield can get away with very coarse geometry (triangles hundreds of meters wide) with almost no visible degradation; Nanite will typically keep more triangles alive than that because of its generality.
+- **Engine dependency**:
+  - You must adopt UE5 wholesale; integrating a custom, sim‑specific renderer into Nanite is difficult.
+  - If you already have a custom engine tuned for sim use (custom atmosphere, sensors, procedural weather, etc.), porting everything to UE just to get Nanite may not be worth it.
+
+### How they compare, practically
+
+For **your exact use case** – fast camera, high altitude, 20 km+ view:
+
+- **Base terrain**:
+  - A geometry‑clipmap or CDLOD‑plus‑tessellation terrain is **hard to beat** for:
+    - Stability under extreme camera motion.
+    - Low and predictable draw call count.
+    - Simple control over triangle density (4–8 px triangles target).
+  - This matches the design goals and techniques used in Frostbite and NVIDIA’s flight‑style demos. [developer.nvidia](https://developer.nvidia.com/gpugems/gpugems2/part-i-geometric-complexity/chapter-2-terrain-rendering-using-gpu-based-geometry)
+
+- **High‑detail local areas (airports, cities, landmarks)**:
+  - Nanite is excellent if you are in UE5:
+    - Directly ingest photogrammetry or ultra‑high‑poly sculpts.
+    - Let Nanite manage LOD and culling.
+  - In a custom engine, a Nanite‑like virtualized geometry system is a large R&D project; geometry clipmaps are comparatively simple.
+
+So for a new **custom terrain engine** for PC flight sim:
+
+- Use a **clipmap/CDLOD terrain heightfield** (possibly with GPU tessellation) as the main world representation.
+- Aim for **triangles several pixels across**, i.e., ~0.05–0.2 triangles per pixel on average, with adaptive distribution.
+- Avoid over‑subdividing tiles for frustum culling alone in the far field; keep patches large and draw‑call count low.
+- If you ever migrate to UE5, treat **Nanite as a powerful complement**:
+  - Base terrain: either Landscape + Nanite or meshes tuned for Nanite.
+  - High‑detail hero areas: pure Nanite assets.
+  - But expect to keep some form of clipmap-like streaming for global coverage.
+
+If you like, the next step can be to sketch a concrete LOD scheme for your 1024 m tiles (ring sizes, screen‑space triangle target, and approximate triangle budgets at 1080p vs 4K).

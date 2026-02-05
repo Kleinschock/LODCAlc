@@ -1,0 +1,68 @@
+## Summary
+Here are the answers to your flight simulator terrain LOD questions:
+
+### **Q1: Maximum Geometric Error at 5km (1 pixel threshold)**
+**Answer: 1.0264 meters** (approximately 1.03m)
+
+At 5km distance with your setup (1024px vertical resolution, 12° VFov), the viewing frustum height is 1051m, giving you 1.0264 meters per pixel. Any terrain geometric error larger than this will be visible on screen.
+
+***
+
+### **Q2: Modifying SSE Formula for Grazing Angles**
+The perspective-corrected SSE formula accounts for foreshortening of vertical errors when viewing at an angle:
+
+```
+SSE (pixels) = (GeometricError × cos(pitch) × VerticalResolution) / (2 × D × tan(VFov/2))
+```
+
+**Key modification:** Multiply the geometric error by **cos(pitch)** where pitch is your camera angle (negative when looking down).
+
+***
+
+### **Q3: Does Grazing Angle Allow Lower LODs Sooner?**
+**Yes, but the benefit at -12° is modest (~2% tolerance increase).**
+
+- At **-12° pitch**: You can tolerate 1.02× larger geometric errors
+- At **-30° pitch**: 1.15× larger errors (15% benefit)
+- At **-45° pitch**: 1.41× larger errors (41% benefit) 
+- At **-60° pitch**: 2.00× larger errors (100% benefit!)
+
+The projected error decreases as **cos(pitch)**, so steeper viewing angles provide substantial LOD savings. For typical flight sim scenarios with moderate pitch angles, implement this—you'll get significant benefits during low-altitude flight and terrain banking.
+
+***
+
+### **Q4: Perspective-Corrected SSE Formula for LOD Selection**
+**Complete formula:**
+
+```
+GeometricError_max(D, pitch) = (D × K) / cos(pitch)
+
+Where: K = 2 × tan(VFov/2) / VerticalResolution
+```
+
+**For your specific configuration:**
+```
+K = 0.00020528
+GeometricError_max(D, pitch) = (D × 0.00020528) / cos(pitch)
+```
+
+**Pseudocode implementation:**
+```cpp
+// Pre-calculate constant
+const float K = 2.0f * tan(VFov / 2.0f) / VerticalResolution;
+
+int SelectLOD(float distance, float pitchAngle) {
+    float cosPitch = cos(pitchAngle);
+    float maxGeoError = (distance * K) / cosPitch;
+    
+    // Select LOD with geometric error ≤ maxGeoError
+    for (int lod = 0; lod < numLODs; lod++) {
+        if (lodGeometricErrors[lod] <= maxGeoError) {
+            return lod;
+        }
+    }
+    return lowestDetailLOD;
+}
+```
+
+The visualization above shows how LOD transition distances change with pitch angle and how foreshortening benefits scale with viewing angle. This approach is definitely worth implementing for flight simulators!
